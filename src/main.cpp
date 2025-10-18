@@ -1,28 +1,30 @@
 #include <Arduino.h>
 
-#include <NimBLEDevice.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 #include <Wire.h>
 #include <RTClib.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <AHTxx.h>
-
 #define SOIL_PIN GPIO_NUM_0     // ADC
-#define SOLENOID_PIN 27 // Relay
+#define SOLENOID_PIN GPIO_NUM_8 // Relay
 
 AHTxx aht25(AHTXX_ADDRESS_X38, AHT2x_SENSOR);
 RTC_DS3231 rtc;
 
-NimBLEServer *pServer = nullptr;
-NimBLECharacteristic *pCharSensor;
-NimBLECharacteristic *pCharControl;
-NimBLECharacteristic *pCharSchedule;
-NimBLECharacteristic *pCharLogs;
-NimBLECharacteristic *pCharRTC;
+BLEServer *pServer = nullptr;
+BLECharacteristic *pCharSensor;
+BLECharacteristic *pCharControl;
+BLECharacteristic *pCharSchedule;
+BLECharacteristic *pCharLogs;
+BLECharacteristic *pCharRTC;
 
 const char *deviceName = "SmartPlant-ESP32";
 
-const uint64_t SENSOR_NOTIFY_INTERVAL_MS = 30000; // 30s
+const uint64_t SENSOR_NOTIFY_INTERVAL_MS = 1000; // 30s
 uint64_t lastSensorMillis = 0;
 
 // Logging
@@ -104,53 +106,83 @@ String readSensorJson()
 }
 
 // BLE write callbacks
-class ControlCallbacks : public NimBLECharacteristicCallbacks
+class ControlCallbacks : public BLECharacteristicCallbacks
 {
-  void onWrite(NimBLECharacteristic *pChar)
+  void onWrite(BLECharacteristic *pChar)
   {
-    std::string val = pChar->getValue();
-    if (val.size() == 0)
+    Serial.println("ControlCallbacks::onWrite triggered");
+    String val = pChar->getValue().c_str();
+    Serial.printf("Received data size: %d\n", val.length());
+    if (val.length() == 0)
       return;
+    
+    Serial.printf("Received data: %s\n", val.c_str());
+    
     // parse JSON
     DynamicJsonDocument doc(256);
     DeserializationError err = deserializeJson(doc, val);
     if (!err)
     {
       const char *cmd = doc["cmd"];
+      Serial.printf("Parsed command: %s\n", cmd ? cmd : "null");
       if (cmd && strcmp(cmd, "trigger") == 0)
       {
         int dur = doc["duration"] | 10;
         // start solenoid for dur seconds
-        digitalWrite(SOLENOID_PIN, HIGH);
+        Serial.printf("Trigger solenoid for %d seconds\n", dur);
+        digitalWrite(SOLENOID_PIN, LOW);
         solenoidRunning = true;
         solenoidStopAt = millis() + uint32_t(dur) * 1000;
       }
       else if (cmd && strcmp(cmd, "cancel") == 0)
       {
-        digitalWrite(SOLENOID_PIN, LOW);
+        Serial.println("Cancel solenoid");
+        digitalWrite(SOLENOID_PIN, HIGH);
         solenoidRunning = false;
       }
+    }
+    else
+    {
+      Serial.printf("JSON parse error: %s\n", err.c_str());
     }
   }
 };
 
-class ScheduleCallbacks : public NimBLECharacteristicCallbacks
+class ScheduleCallbacks : public BLECharacteristicCallbacks
 {
-  void onWrite(NimBLECharacteristic *pChar)
+  void onWrite(BLECharacteristic *pChar)
   {
-    std::string val = pChar->getValue();
-    if (val.size() == 0)
+    Serial.println("ScheduleCallbacks::onWrite triggered");
+    String val = pChar->getValue().c_str();
+    Serial.printf("Schedule data size: %d\n", val.length());
+    if (val.length() == 0)
       return;
+    
+    Serial.printf("Schedule data: %s\n", val.c_str());
+    
     DynamicJsonDocument doc(512);
-    if (deserializeJson(doc, val))
+    DeserializationError err = deserializeJson(doc, val);
+    if (err)
+    {
+      Serial.printf("Schedule JSON parse error: %s\n", err.c_str());
       return;
+    }
+    
     // Expect {"slot":1,"time":"07:30","duration":15,"enabled":1}
     int slot = doc["slot"] | -1;
     if (slot < 0 || slot >= MAX_SLOTS)
+    {
+      Serial.printf("Invalid slot: %d\n", slot);
       return;
+    }
+    
     const char *timestr = doc["time"];
     int dur = doc["duration"] | 0;
     int enabled = doc["enabled"] | 0;
+    
+    Serial.printf("Parsed - slot:%d, time:%s, duration:%d, enabled:%d\n",
+                  slot, timestr ? timestr : "null", dur, enabled);
+    
     if (timestr)
     {
       int hh = 0, mm = 0;
@@ -159,6 +191,10 @@ class ScheduleCallbacks : public NimBLECharacteristicCallbacks
       slots[slot].minute = mm;
       slots[slot].duration_seconds = dur;
       slots[slot].enabled = enabled;
+      
+      Serial.printf("Updated slot %d: %02d:%02d, %ds, %s\n",
+                    slot, hh, mm, dur, enabled ? "enabled" : "disabled");
+      
       // save schedules
       File f = LittleFS.open("/schedules.json", "w");
       if (f)
@@ -174,121 +210,216 @@ class ScheduleCallbacks : public NimBLECharacteristicCallbacks
         }
         serializeJson(root, f);
         f.close();
+        Serial.println("Schedules saved to file");
+      }
+      else
+      {
+        Serial.println("Failed to save schedules");
       }
     }
   }
 };
 
-class RTCWriteCallbacks : public NimBLECharacteristicCallbacks
+class RTCWriteCallbacks : public BLECharacteristicCallbacks
 {
-  void onWrite(NimBLECharacteristic *pChar)
+  void onWrite(BLECharacteristic *pChar)
   {
-    std::string val = pChar->getValue();
-    if (val.size() == 0)
+    Serial.println("RTCWriteCallbacks::onWrite triggered");
+    String val = pChar->getValue().c_str();
+    Serial.printf("RTC data size: %d\n", val.length());
+    if (val.length() == 0)
       return;
+    
+    Serial.printf("RTC data: %s\n", val.c_str());
+    
     DynamicJsonDocument doc(256);
-    if (deserializeJson(doc, val))
+    DeserializationError err = deserializeJson(doc, val);
+    if (err)
     {
-      // expect {"epoch":1700000000}
-      uint32_t e = doc["epoch"] | 0;
-      if (e > 1000000000)
-      {
-        rtc.adjust(DateTime(e));
-      }
+      Serial.printf("RTC JSON parse error: %s\n", err.c_str());
+      return;
+    }
+    
+    // expect {"epoch":1700000000}
+    uint32_t e = doc["epoch"] | 0;
+    Serial.printf("Parsed epoch: %u\n", e);
+    if (e > 1000000000)
+    {
+      rtc.adjust(DateTime(e));
+      Serial.println("RTC time updated");
+    }
+    else
+    {
+      Serial.println("Invalid epoch value");
     }
   }
 };
 
-class LogsCallbacks : public NimBLECharacteristicCallbacks
+class LogsCallbacks : public BLECharacteristicCallbacks
 {
-  void onWrite(NimBLECharacteristic *pChar)
+  void onWrite(BLECharacteristic *pChar)
   {
-    std::string val = pChar->getValue();
-    if (val.size() == 0)
+    Serial.println("LogsCallbacks::onWrite triggered");
+    String val = pChar->getValue().c_str();
+    Serial.printf("Logs data size: %d\n", val.length());
+    if (val.length() == 0)
       return;
+    
+    Serial.printf("Logs data: %s\n", val.c_str());
+    
     DynamicJsonDocument doc(256);
-    if (deserializeJson(doc, val))
+    DeserializationError err = deserializeJson(doc, val);
+    if (err)
     {
-      const char *action = doc["action"];
-      if (action && strcmp(action, "get") == 0)
+      Serial.printf("Logs JSON parse error: %s\n", err.c_str());
+      return;
+    }
+    
+    const char *action = doc["action"];
+    Serial.printf("Logs action: %s\n", action ? action : "null");
+    
+    if (action && strcmp(action, "get") == 0)
+    {
+      uint32_t start = doc["start"] | 0;
+      Serial.printf("Starting log stream from line %u\n", start);
+      
+      // stream logs starting from start line index
+      File f = LittleFS.open(LOG_PATH, "r");
+      if (!f)
       {
-        uint32_t start = doc["start"] | 0;
-        // stream logs starting from start line index
-        File f = LittleFS.open(LOG_PATH, "r");
-        if (!f)
-          return;
-        // naive: read lines and notify from start index
-        uint32_t idx = 0;
-        String chunk;
-        while (f.available())
+        Serial.println("Failed to open log file");
+        return;
+      }
+      
+      // naive: read lines and notify from start index
+      uint32_t idx = 0;
+      uint32_t sent = 0;
+      while (f.available())
+      {
+        String line = f.readStringUntil('\n');
+        if (idx >= start)
         {
-          String line = f.readStringUntil('\n');
-          if (idx >= start)
-          {
-            // send line by notifications; chunk to MTU if needed
-            pChar->setValue((uint8_t *)line.c_str(), line.length());
-            pChar->notify();
-            delay(20); // small delay to avoid BLE buffer overflow
-          }
-          idx++;
+          // send line by notifications; chunk to MTU if needed
+          pChar->setValue(line.c_str());
+          pChar->notify();
+          sent++;
+          delay(20); // small delay to avoid BLE buffer overflow
         }
-        f.close();
+        idx++;
       }
+      f.close();
+      Serial.printf("Sent %u log lines\n", sent);
     }
   }
 };
 
-class CCCDCallbacks : public NimBLEDescriptorCallbacks
-{
-  void onWrite(NimBLEDescriptor *desc, NimBLEConnInfo &connInfo) override
-  {
-    std::string val = desc->getValue();
-    bool notifyEnabled = (val.length() > 0 && (val[0] & 0x01));
-    Serial.printf("Notifications %s\n", notifyEnabled ? "ENABLED" : "DISABLED");
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    Serial.println("Client connected");
+  }
+  
+  void onDisconnect(BLEServer* pServer) {
+    Serial.println("Client disconnected");
+    notifyEnabled = false;
+    // Restart advertising
+    BLEDevice::startAdvertising();
+  }
+};
+
+class SensorCallbacks : public BLECharacteristicCallbacks {
+  void onRead(BLECharacteristic* pChar) {
+    Serial.println("Sensor data read requested");
+    String json = readSensorJson();
+    pChar->setValue(json.c_str());
   }
 
-  void onRead(NimBLEDescriptor *desc, NimBLEConnInfo &connInfo) override
-  {
-    Serial.println("Descriptor read");
+  void onWrite(BLECharacteristic* pChar) {
+    // Handle subscription changes
+    Serial.println("Sensor characteristic written to");
+    String value = pChar->getValue().c_str();
+    if (value.length() > 0) {
+      // Check if notifications are enabled by examining descriptor
+      BLE2902* pDescriptor = (BLE2902*)pChar->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+      if (pDescriptor) {
+        if (pDescriptor->getNotifications()) {
+          notifyEnabled = true;
+          Serial.println("Client subscribed to notifications");
+        } else {
+          notifyEnabled = false;
+          Serial.println("Client unsubscribed from notifications");
+        }
+      }
+    }
   }
 };
 
 void startBLE()
 {
-  NimBLEDevice::init(deviceName);
-  NimBLEServer *pServer = NimBLEDevice::createServer();
+  Serial.println("Initializing BLE...");
+  
+  BLEDevice::init(deviceName);
+  Serial.println("BLE device initialized");
+  
+  pServer = BLEDevice::createServer();
+  Serial.println("BLE server created");
+  
+  pServer->setCallbacks(new ServerCallbacks());
+  Serial.println("Server callbacks set");
 
-  NimBLEService *svc = pServer->createService("0000a000-0000-1000-8000-00805f9b34fb");
+  BLEService *svc = pServer->createService("0000a000-0000-1000-8000-00805f9b34fb");
+  Serial.println("BLE service created");
 
   pCharSensor = svc->createCharacteristic("0000a001-0000-1000-8000-00805f9b34fb",
-                                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-  pCharControl = svc->createCharacteristic("0000a002-0000-1000-8000-00805f9b34fb",
-                                           NIMBLE_PROPERTY::WRITE);
-  pCharSchedule = svc->createCharacteristic("0000a003-0000-1000-8000-00805f9b34fb",
-                                            NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::READ);
-  pCharLogs = svc->createCharacteristic("0000a004-0000-1000-8000-00805f9b34fb",
-                                        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
-  pCharRTC = svc->createCharacteristic("0000a005-0000-1000-8000-00805f9b34fb",
-                                       NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::READ);
-
-  pCharControl->setCallbacks(new ControlCallbacks());
-  pCharSchedule->setCallbacks(new ScheduleCallbacks());
-  pCharLogs->setCallbacks(new LogsCallbacks());
-  pCharRTC->setCallbacks(new RTCWriteCallbacks());
-
-  NimBLEDescriptor *pCCCD = pCharSensor->createDescriptor(
-      "2902",
-      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE,
-      2);
+                                          BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  Serial.println("Sensor characteristic created");
   
-  pCCCD->setCallbacks(new CCCDCallbacks());
+  pCharControl = svc->createCharacteristic("0000a002-0000-1000-8000-00805f9b34fb",
+                                           BLECharacteristic::PROPERTY_WRITE);
+  Serial.println("Control characteristic created");
+  
+  pCharSchedule = svc->createCharacteristic("0000a003-0000-1000-8000-00805f9b34fb",
+                                            BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_READ);
+  Serial.println("Schedule characteristic created");
+  
+  pCharLogs = svc->createCharacteristic("0000a004-0000-1000-8000-00805f9b34fb",
+                                        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
+  Serial.println("Logs characteristic created");
+  
+  pCharRTC = svc->createCharacteristic("0000a005-0000-1000-8000-00805f9b34fb",
+                                       BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_READ);
+  Serial.println("RTC characteristic created");
 
+  // Add descriptors for notify characteristics
+  pCharSensor->addDescriptor(new BLE2902());
+  pCharLogs->addDescriptor(new BLE2902());
+
+  // Set callbacks
+  pCharControl->setCallbacks(new ControlCallbacks());
+  Serial.println("Control callbacks set");
+  
+  pCharSchedule->setCallbacks(new ScheduleCallbacks());
+  Serial.println("Schedule callbacks set");
+  
+  pCharLogs->setCallbacks(new LogsCallbacks());
+  Serial.println("Logs callbacks set");
+  
+  pCharRTC->setCallbacks(new RTCWriteCallbacks());
+  Serial.println("RTC callbacks set");
+  
+  pCharSensor->setCallbacks(new SensorCallbacks());
+  Serial.println("Sensor callbacks set");
+  
   svc->start();
+  Serial.println("BLE service started");
 
-  NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
-  pAdv->addServiceUUID(svc->getUUID());
-  pAdv->start();
-  Serial.println("BLE started, advertising.");
+  BLEAdvertising *pAdv = BLEDevice::getAdvertising();
+  pAdv->addServiceUUID("0000a000-0000-1000-8000-00805f9b34fb");
+  pAdv->setScanResponse(false);
+  pAdv->setMinPreferred(0x0);
+  BLEDevice::startAdvertising();
+  Serial.println("BLE advertising started");
+  Serial.printf("Device name: %s\n", deviceName);
+  Serial.println("BLE initialization complete");
 }
 
 void loadSchedules()
@@ -327,11 +458,16 @@ void loadSchedules()
 
 void setup()
 {
-  Serial.begin(115200);
   pinMode(SOLENOID_PIN, OUTPUT);
-  digitalWrite(SOLENOID_PIN, LOW);
+  digitalWrite(SOLENOID_PIN, HIGH);  // Relay OFF initially (for low-level relay)
+  Serial.begin(115200);
+  Serial.println("Starting...");
 
-  LittleFS.begin();
+  if (!LittleFS.begin(true)) {   // true = format automatically if mount fails
+    Serial.println("LittleFS mount failed");
+    while (true) delay(100);
+  }
+  Serial.println("LittleFS mounted successfully");
 
   Wire.begin();
   if (!rtc.begin())
@@ -354,12 +490,14 @@ void loop()
   {
     lastSensorMillis = nowMs;
     String json = readSensorJson();
+    Serial.println("Sensor: " + json);
 
     // if client subscribed -> notify
-    if (notifyEnabled)
+    if (notifyEnabled && pServer->getConnectedCount() > 0)
     {
-      pCharSensor->setValue((uint8_t *)json.c_str(), json.length());
+      pCharSensor->setValue(json.c_str());
       pCharSensor->notify();
+      Serial.println("Sensor notification sent");
     }
     else
     {
@@ -373,7 +511,7 @@ void loop()
   // check solenoid stop
   if (solenoidRunning && millis() >= solenoidStopAt)
   {
-    digitalWrite(SOLENOID_PIN, LOW);
+    digitalWrite(SOLENOID_PIN, HIGH);
     solenoidRunning = false;
   }
 
@@ -394,7 +532,7 @@ void loop()
         if (slots[i].last_run_day != dayCounter)
         {
           // start valve
-          digitalWrite(SOLENOID_PIN, HIGH);
+          digitalWrite(SOLENOID_PIN, LOW);
           solenoidRunning = true;
           solenoidStopAt = millis() + uint32_t(slots[i].duration_seconds) * 1000;
           slots[i].last_run_day = dayCounter;
