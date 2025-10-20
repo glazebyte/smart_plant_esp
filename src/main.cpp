@@ -87,6 +87,7 @@ String readSensorJson()
   humidity = aht25.readHumidity();
   temp = aht25.readTemperature();
   soilRaw = analogRead(SOIL_PIN); // raw 0-4095
+  float soil = soilRaw / 4095.0 * 100.0; // percentage 
   // assume divider and convert to volts; adjust dividerFactor
   const float dividerFactor = 2.0; // example
 
@@ -96,7 +97,7 @@ String readSensorJson()
   StaticJsonDocument<128> doc;
   doc["t"] = ts;
   if (!isnan(soilRaw))
-    doc["s"] = (int)soilRaw; // Shortened key names to save space
+    doc["s"] = (int)(soil * 100) / 100.0; // Round to 2 decimal places
   if (!isnan(humidity))
     doc["h"] = (int)(humidity * 100) / 100.0; // Round to 2 decimal places
   if (!isnan(temp))
