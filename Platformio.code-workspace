@@ -1,0 +1,27 @@
+{
+	"folders": [
+		{
+			"path": "../../Platformio"
+		},
+		{
+			"name": "smart_plant_esp",
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"ahtxx.h": "c",
+			"array": "cpp",
+			"deque": "cpp",
+			"string": "cpp",
+			"unordered_map": "cpp",
+			"unordered_set": "cpp",
+			"vector": "cpp",
+			"string_view": "cpp",
+			"initializer_list": "cpp",
+			"format": "cpp",
+			"span": "cpp",
+			"text_encoding": "cpp"
+		}
+	}
+}

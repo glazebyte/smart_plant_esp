@@ -10,7 +10,7 @@
 #include <ArduinoJson.h>
 #include <AHTxx.h>
 #define SOIL_PIN GPIO_NUM_0     // ADC
-#define SOLENOID_PIN GPIO_NUM_8 // Relay
+#define SOLENOID_PIN GPIO_NUM_3 // Relay
 
 AHTxx aht25(AHTXX_ADDRESS_X38, AHT2x_SENSOR);
 RTC_DS3231 rtc;
@@ -134,14 +134,14 @@ class ControlCallbacks : public BLECharacteristicCallbacks
         int dur = doc["duration"] | 10;
         // start solenoid for dur seconds
         Serial.printf("Trigger solenoid for %d seconds\n", dur);
-        digitalWrite(SOLENOID_PIN, LOW);
+        digitalWrite(SOLENOID_PIN, HIGH);
         solenoidRunning = true;
         solenoidStopAt = millis() + uint32_t(dur) * 1000;
       }
       else if (cmd && strcmp(cmd, "cancel") == 0)
       {
         Serial.println("Cancel solenoid");
-        digitalWrite(SOLENOID_PIN, HIGH);
+        digitalWrite(SOLENOID_PIN, LOW);
         solenoidRunning = false;
       }
     }
@@ -496,7 +496,6 @@ void loadSchedules()
 void setup()
 {
   pinMode(SOLENOID_PIN, OUTPUT);
-  digitalWrite(SOLENOID_PIN, HIGH); // Relay OFF initially (for low-level relay)
   Serial.begin(115200);
   Serial.println("Starting...");
 
@@ -508,12 +507,12 @@ void setup()
   }
   Serial.println("LittleFS mounted successfully");
 
-  Wire.begin();
+  Wire.begin(SDA, SCL);
   if (!rtc.begin())
   {
     Serial.println("RTC not found!");
   }
-  aht25.begin();
+  aht25.begin(SDA,SCL);
 
   loadSchedules();
   startBLE();
@@ -562,7 +561,7 @@ void loop()
   // check solenoid stop
   if (solenoidRunning && millis() >= solenoidStopAt)
   {
-    digitalWrite(SOLENOID_PIN, HIGH);
+    digitalWrite(SOLENOID_PIN, LOW);
     solenoidRunning = false;
   }
 
@@ -583,7 +582,7 @@ void loop()
         if (slots[i].last_run_day != dayCounter)
         {
           // start valve
-          digitalWrite(SOLENOID_PIN, LOW);
+          digitalWrite(SOLENOID_PIN, HIGH);
           solenoidRunning = true;
           solenoidStopAt = millis() + uint32_t(slots[i].duration_seconds) * 1000;
           slots[i].last_run_day = dayCounter;
