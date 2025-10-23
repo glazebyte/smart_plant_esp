@@ -5,15 +5,27 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <Wire.h>
+#ifdef BOARD_TYPE_1
 #include <RTClib.h>
+#elif defined(BOARD_TYPE_2)
+#include <time.h>
+#endif
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <AHTxx.h>
+
+#ifdef BOARD_TYPE_1
 #define SOIL_PIN GPIO_NUM_0     // ADC
 #define SOLENOID_PIN GPIO_NUM_3 // Relay
+#elif defined(BOARD_TYPE_2)
+#define SOIL_PIN GPIO_NUM_12     // ADC
+#define SOLENOID_PIN GPIO_NUM_13 // Relay
+#endif
 
+#ifdef BOARD_TYPE_1
 AHTxx aht25(AHTXX_ADDRESS_X38, AHT2x_SENSOR);
 RTC_DS3231 rtc;
+#endif
 
 BLEServer *pServer = nullptr;
 BLECharacteristic *pCharSensor;
@@ -49,13 +61,44 @@ volatile bool solenoidRunning = false;
 uint32_t solenoidStopAt = 0;
 bool notifyEnabled = false;
 const int MTU_SIZE = 75;
+const int timezone = 7;
 
 // utility: get epoch from RTC
+#ifdef BOARD_TYPE_1
 uint32_t rtc_epoch()
 {
   DateTime now = rtc.now();
   return (uint32_t)now.unixtime();
 }
+#elif defined(BOARD_TYPE_2)
+uint32_t rtc_epoch()
+{
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo))
+  {
+    Serial.println("Failed to obtain time");
+    return 0;
+  }
+  return (uint32_t)mktime(&timeinfo);
+}
+#endif
+
+#ifdef BOARD_TYPE_2
+void setupTime()
+{
+struct tm tm;
+  tm.tm_year = 2025 - 1900;  // years since 1900
+  tm.tm_mon  = 9;            // month 0–11 (October = 9)
+  tm.tm_mday = 23;           // day of month
+  tm.tm_hour = 12;
+  tm.tm_min  = 0;
+  tm.tm_sec  = 0;
+  time_t t = mktime(&tm);
+
+  struct timeval now = { .tv_sec = t };
+  settimeofday(&now, NULL);  // set system timeu
+}
+#endif
 
 // helper to append log (JSON line)
 void appendLog(JsonDocument &doc)
@@ -84,12 +127,18 @@ void appendLog(JsonDocument &doc)
 String readSensorJson()
 {
   float humidity = NAN, temp = NAN, soilRaw = NAN, battery = NAN;
+  #ifdef BOARD_TYPE_1
   humidity = aht25.readHumidity();
   temp = aht25.readTemperature();
-  soilRaw = analogRead(SOIL_PIN); // raw 0-4095
-  float soil = soilRaw / 4095.0 * 100.0; // percentage 
-  // assume divider and convert to volts; adjust dividerFactor
-  const float dividerFactor = 2.0; // example
+  soilRaw = analogRead(SOIL_PIN);        // raw 0-4095
+  #elif defined(BOARD_TYPE_2)
+  humidity = random(4000, 6000) / 100.0; // simulate
+  temp = random(2000, 3000) / 100.0;     // simulate
+  soilRaw = random(0, 4096);              // simulate
+  #endif
+
+  float soil = soilRaw / 4095.0 * 100.0; // percentage
+
 
   uint32_t ts = rtc_epoch();
 
@@ -181,46 +230,80 @@ class ScheduleCallbacks : public BLECharacteristicCallbacks
     }
 
     const char *timestr = doc["time"];
-    int dur = doc["duration"] | 0;
+    int dur = doc["duration"] | -1; // Use -1 to detect if duration was provided
     int enabled = doc["enabled"] | 0;
 
     Serial.printf("Parsed - slot:%d, time:%s, duration:%d, enabled:%d\n",
                   slot, timestr ? timestr : "null", dur, enabled);
 
+    // Always update enabled status
+    slots[slot].enabled = enabled;
+
+    // Only update time and duration if they are provided
     if (timestr)
     {
       int hh = 0, mm = 0;
       sscanf(timestr, "%d:%d", &hh, &mm);
       slots[slot].hour = hh;
       slots[slot].minute = mm;
-      slots[slot].duration_seconds = dur;
-      slots[slot].enabled = enabled;
-
-      Serial.printf("Updated slot %d: %02d:%02d, %ds, %s\n",
-                    slot, hh, mm, dur, enabled ? "enabled" : "disabled");
-
-      // save schedules
-      File f = LittleFS.open("/schedules.json", "w");
-      if (f)
-      {
-        DynamicJsonDocument root(512);
-        for (int i = 0; i < MAX_SLOTS; i++)
-        {
-          JsonObject so = root[String(i)];
-          so["enabled"] = slots[i].enabled;
-          so["hour"] = slots[i].hour;
-          so["minute"] = slots[i].minute;
-          so["duration"] = slots[i].duration_seconds;
-        }
-        serializeJson(root, f);
-        f.close();
-        Serial.println("Schedules saved to file");
-      }
-      else
-      {
-        Serial.println("Failed to save schedules");
-      }
     }
+
+    if (dur >= 0) // Only update duration if it was explicitly provided
+    {
+      slots[slot].duration_seconds = dur;
+    }
+
+    Serial.printf("Updated slot %d: %02d:%02d, %ds, %s\n",
+                  slot, slots[slot].hour, slots[slot].minute, slots[slot].duration_seconds, enabled ? "enabled" : "disabled");
+
+    // save schedules
+    File f = LittleFS.open("/schedules.json", "w");
+    if (f)
+    {
+      DynamicJsonDocument root(512);
+      JsonArray scheduleArray = root.to<JsonArray>();
+      for (int i = 0; i < MAX_SLOTS; i++)
+      {
+        JsonObject so = scheduleArray.createNestedObject();
+        so["enabled"] = slots[i].enabled;
+        so["hour"] = slots[i].hour;
+        so["minute"] = slots[i].minute;
+        so["duration"] = slots[i].duration_seconds;
+      }
+      serializeJson(root, f);
+      String out;
+      serializeJson(root, out);
+      Serial.printf("Saving schedules JSON: %s\n", out.c_str());
+
+      f.close();
+      Serial.println("Schedules saved to file");
+    }
+    else
+    {
+      Serial.println("Failed to save schedules");
+    }
+  }
+  void onRead(BLECharacteristic *pChar)
+  {
+    Serial.println("ScheduleCallbacks::onRead triggered");
+    // send current schedules as JSON array
+    DynamicJsonDocument root(512);
+    JsonArray scheduleArray = root.to<JsonArray>();
+
+    for (int i = 0; i < MAX_SLOTS; i++)
+    {
+      JsonObject so = scheduleArray.createNestedObject();
+      so["slot"] = i;
+      so["enabled"] = slots[i].enabled;
+      char timebuf[6];
+      snprintf(timebuf, sizeof(timebuf), "%02d:%02d", slots[i].hour, slots[i].minute);
+      so["time"] = timebuf;
+      so["duration"] = slots[i].duration_seconds;
+    }
+    String out;
+    serializeJson(root, out);
+    pChar->setValue(out.c_str());
+    Serial.printf("Sent schedules JSON: %s\n", out.c_str());
   }
 };
 
@@ -249,7 +332,13 @@ class RTCWriteCallbacks : public BLECharacteristicCallbacks
     Serial.printf("Parsed epoch: %u\n", e);
     if (e > 1000000000)
     {
+      #ifdef BOARD_TYPE_1
       rtc.adjust(DateTime(e));
+      #elif defined(BOARD_TYPE_2)
+      struct timeval timeinfo;
+      timeinfo.tv_sec = e;
+      settimeofday(&timeinfo, nullptr);
+      #endif
       Serial.println("RTC time updated");
     }
     else
@@ -463,15 +552,21 @@ void loadSchedules()
 {
   if (LittleFS.exists("/schedules.json"))
   {
+    Serial.println("Loading schedules from /schedules.json");
     File f = LittleFS.open("/schedules.json", "r");
     if (!f)
+    {
+      Serial.println("Failed to open schedules file");
       return;
+    }
     DynamicJsonDocument root(512);
     deserializeJson(root, f);
+    JsonArray scheduleArray = root.as<JsonArray>();
+    Serial.println(root.as<String>());
     for (int i = 0; i < MAX_SLOTS; i++)
     {
-      JsonObject so = root[String(i)];
-      slots[i].enabled = so["enabled"] | 0;
+      JsonObject so = scheduleArray[i];
+      slots[i].enabled = so["enabled"] | false;
       slots[i].hour = so["hour"] | 0;
       slots[i].minute = so["minute"] | 0;
       slots[i].duration_seconds = so["duration"] | 0;
@@ -508,11 +603,15 @@ void setup()
   Serial.println("LittleFS mounted successfully");
 
   Wire.begin(SDA, SCL);
+  #ifdef BOARD_TYPE_1
   if (!rtc.begin())
   {
     Serial.println("RTC not found!");
   }
-  aht25.begin(SDA,SCL);
+  aht25.begin(SDA, SCL);
+  #elif defined(BOARD_TYPE_2)
+  setupTime();
+  #endif
 
   loadSchedules();
   startBLE();
@@ -569,12 +668,19 @@ void loop()
   static uint32_t lastSchedCheck = 0;
   if (millis() - lastSchedCheck > 20000)
   {
+    Serial.println("Checking schedules...");
     lastSchedCheck = millis();
-    DateTime now = rtc.now();
+    #ifdef BOARD_TYPE_1
+    DateTime utc = rtc.now();
+    DateTime now = utc + TimeSpan(timezone * 3600);
+    Serial.printf("Current time: %02d:%02d\n", now.hour(), now.minute());
     uint32_t dayCounter = now.day() + now.month() * 100 + now.year() * 10000; // simple unique per day value
 
     for (int i = 0; i < MAX_SLOTS; i++)
     {
+      Serial.printf("Slot %d: enabled=%d, time=%02d:%02d, duration=%ds, last_run_day=%u\n",
+                    i, slots[i].enabled, slots[i].hour, slots[i].minute,
+                    slots[i].duration_seconds, slots[i].last_run_day);
       if (!slots[i].enabled)
         continue;
       if (slots[i].hour == now.hour() && slots[i].minute == now.minute())
@@ -595,6 +701,14 @@ void loop()
         }
       }
     }
+    #elif defined(BOARD_TYPE_2)
+    for (int i = 0; i < MAX_SLOTS; i++)
+    {
+      Serial.printf("Slot %d: enabled=%d, time=%02d:%02d, duration=%ds, last_run_day=%u\n",
+                    i, slots[i].enabled, slots[i].hour, slots[i].minute,
+                    slots[i].duration_seconds, slots[i].last_run_day);
+    }
+    #endif
   }
 
   delay(20);
